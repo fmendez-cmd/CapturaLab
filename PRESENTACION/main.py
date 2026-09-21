@@ -1331,6 +1331,8 @@ if __name__ in {
 }:
 
     ui.run(
-        title="LabCaptura Geotest",
-        port=8080,
-    )
+    title="LabCaptura Geotest",
+    host="0.0.0.0",
+    port=8080,
+    reload=False,
+)

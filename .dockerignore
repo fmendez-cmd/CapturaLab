@@ -1,0 +1,13 @@
+.git
+.gitignore
+.env
+venv
+.venv
+__pycache__
+*.pyc
+*.pyo
+*.log
+ARCHIVOS_ENTRADA
+SALIDAS_PRUEBA
+MAPAS_ERP_DIAGNOSTICO
+service_account.json
