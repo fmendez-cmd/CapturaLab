@@ -19,7 +19,7 @@ from INFRAESTRUCTURA.config_rutas import TEMP_PLANTILLAS_DIR
 
 
 class GeneradorExcel:
-    PASSWORD_HOJA = "686"
+    PASSWORDS_HOJA = ("686", "20000000")
 
     XL_CALCULATION_AUTOMATIC = -4105
     XL_CALCULATION_MANUAL = -4135
@@ -126,41 +126,56 @@ class GeneradorExcel:
         return estado
 
     @staticmethod
-    def _desproteger(hoja, estado: dict):
+    def _desproteger(hoja, estado: dict) -> str | None:
         if not estado["protegida"]:
             print("Hoja ERP sin protección.")
-            return
+            return None
 
         print(
-            "Desprotegiendo hoja ERP con "
-            "la contraseña configurada..."
+            "Desprotegiendo hoja ERP con una "
+            "contraseña autorizada..."
         )
 
-        hoja.Unprotect(
-            Password=GeneradorExcel.PASSWORD_HOJA
-        )
+        for password in GeneradorExcel.PASSWORDS_HOJA:
+            try:
+                hoja.Unprotect(Password=password)
+            except Exception:
+                continue
 
-        try:
-            sigue = bool(hoja.ProtectContents)
-        except Exception:
-            sigue = False
+            try:
+                sigue = bool(hoja.ProtectContents)
+            except Exception:
+                sigue = False
 
-        if sigue:
-            raise RuntimeError(
-                "No se pudo desproteger la hoja ERP."
-            )
+            if not sigue:
+                print(
+                    "✅ Hoja ERP desprotegida temporalmente."
+                )
+                # Se devuelve para restaurar exactamente la misma contraseña.
+                return password
 
-        print(
-            "✅ Hoja ERP desprotegida temporalmente."
+        raise RuntimeError(
+            "No se pudo desproteger la hoja ERP con las "
+            "contraseñas autorizadas."
         )
 
     @staticmethod
-    def _reproteger(hoja, estado: dict):
+    def _reproteger(
+        hoja,
+        estado: dict,
+        password_usado: str | None,
+    ):
         if not estado["protegida"]:
             return
 
+        if not password_usado:
+            raise RuntimeError(
+                "No se conoce la contraseña original con la que "
+                "debe restaurarse la protección de la hoja ERP."
+            )
+
         hoja.Protect(
-            Password=GeneradorExcel.PASSWORD_HOJA,
+            Password=password_usado,
             DrawingObjects=estado["drawing_objects"],
             Contents=estado["contents"],
             Scenarios=estado["scenarios"],
@@ -197,14 +212,12 @@ class GeneradorExcel:
 
             valor = origen.Value2
 
-            # El mapa v2 solo contiene celdas no vacías.
-            if valor is None or str(valor) == "":
-                raise ValueError(
-                    f"Operación {indice}: "
-                    f"el origen {op['origen']} quedó vacío. "
-                    "El formato ya no coincide con el mapa."
-                )
-
+            # Una celda mapeada puede estar vacía en un ensayo concreto.
+            # La posición NO se compacta ni se desplaza:
+            # origen y destino conservan siempre la correspondencia física.
+            #
+            # Si el origen está vacío, dejamos explícitamente vacío el destino.
+            # Un 0 o un "-" NO son vacíos y se copian normalmente.
             try:
                 if bool(destino.HasFormula):
                     raise ValueError(
@@ -213,6 +226,10 @@ class GeneradorExcel:
                     )
             except TypeError:
                 pass
+
+            if valor is None or str(valor) == "":
+                destino.Value2 = None
+                continue
 
             destino.Value2 = valor
             escritos += 1
@@ -243,11 +260,15 @@ class GeneradorExcel:
             a = origen.Value2
             b = destino.Value2
 
-            # Comparación segura por representación.
-            if a is None and b is None:
+            # Vacío en origen = vacío en la misma posición destino.
+            # Excel COM puede representar una celda vacía como None o "".
+            a_vacio = a is None or str(a) == ""
+            b_vacio = b is None or str(b) == ""
+
+            if a_vacio and b_vacio:
                 continue
 
-            if str(a) != str(b):
+            if a_vacio != b_vacio or str(a) != str(b):
                 errores.append(
                     (
                         op["origen"],
@@ -467,13 +488,13 @@ class GeneradorExcel:
                 )
             )
 
-            GeneradorExcel._desproteger(
+            password_proteccion = GeneradorExcel._desproteger(
                 hoja_d,
                 estado,
             )
 
             # ----------------------------------------------------
-            # 6. Aplicar TODA la estructura no vacía
+            # 6. Aplicar mapa conservando posiciones y vacíos
             # ----------------------------------------------------
             _t = time.perf_counter()
             escritos = (
@@ -568,6 +589,7 @@ class GeneradorExcel:
             GeneradorExcel._reproteger(
                 hoja_d,
                 estado,
+                password_proteccion,
             )
 
             libro_d.Save()

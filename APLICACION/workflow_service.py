@@ -6,6 +6,8 @@ import traceback
 import threading
 
 from DOMINIO.generador_excel import GeneradorExcel
+from DOMINIO.gestor_mapas import GestorMapas
+from INFRAESTRUCTURA.drive_connector import DriveConnector
 from INFRAESTRUCTURA.config_rutas import DOCUMENTOS_DIR
 from DOMINIO.control_cancelacion import (
     establecer_evento_cancelacion,
@@ -175,6 +177,14 @@ class WorkflowService:
             if m:
                 return m.group(1)
 
+        # Formato real robusto:
+        # ..._15975_15975-417_... / ..._17215_17215-1276_...
+        # La descripción del ensaye puede aparecer entre GST y la OT.
+        for texto in textos:
+            m = re.search(r"(?<!\d)(\d{3,})_\1-\d+", texto)
+            if m:
+                return m.group(1)
+
         # Formato actual:
         # E-1524_GST-042_17215_17215-1276_PCA-19.xls
         for texto in textos:
@@ -202,6 +212,27 @@ class WorkflowService:
     # =========================================================
 
     def procesar_lote_carpetas(
+        self,
+        carpetas_dict: dict,
+        progress_callback=None,
+    ) -> dict:
+        """Procesa un lote con caché efímero de plantillas y mapas."""
+        DriveConnector.iniciar_cache_lote()
+        GestorMapas.iniciar_cache_lote()
+
+        try:
+            return self._procesar_lote_carpetas_sin_cache_wrapper(
+                carpetas_dict,
+                progress_callback=progress_callback,
+            )
+        finally:
+            # Se ejecuta también con return temprano, cancelación o excepción.
+            GestorMapas.limpiar_cache_lote()
+            DriveConnector.limpiar_cache_lote()
+            limpiar_evento_cancelacion()
+            print("🧹 Caché del lote finalizado y liberado.")
+
+    def _procesar_lote_carpetas_sin_cache_wrapper(
         self,
         carpetas_dict: dict,
         progress_callback=None,

@@ -22,6 +22,32 @@ from INFRAESTRUCTURA.config_rutas import (
 
 class DriveConnector:
 
+    # Caché VOLÁTIL de plantillas. Solo existe durante un lote.
+    _cache_lote_activo = False
+    _cache_plantillas_lote = {}
+
+    @staticmethod
+    def iniciar_cache_lote():
+        DriveConnector._cache_lote_activo = True
+        DriveConnector._cache_plantillas_lote = {}
+        print("⚡ Caché temporal de plantillas iniciado.")
+
+    @staticmethod
+    def limpiar_cache_lote():
+        # Las plantillas descargadas son temporales. Se eliminan al cerrar el lote.
+        rutas = set(DriveConnector._cache_plantillas_lote.values())
+        DriveConnector._cache_plantillas_lote = {}
+        DriveConnector._cache_lote_activo = False
+
+        for ruta in rutas:
+            try:
+                if ruta and os.path.isfile(ruta):
+                    os.remove(ruta)
+            except Exception as error:
+                print(f"⚠️ No se pudo borrar plantilla temporal '{ruta}': {error}")
+
+        print("🧹 Caché temporal de plantillas limpiado.")
+
     # ==========================================================
     # IMPORTANTE
     # ==========================================================
@@ -187,148 +213,161 @@ class DriveConnector:
         codigo_gst: str
     ) -> str:
 
-        codigo_limpio = (
-            codigo_gst
-            .upper()
-            .strip()
-        )
+        clave_cache = str(codigo_gst).upper().strip()
+        if DriveConnector._cache_lote_activo:
+            ruta_cache = DriveConnector._cache_plantillas_lote.get(clave_cache)
+            if ruta_cache and os.path.isfile(ruta_cache):
+                print(f"⚡ Plantilla {codigo_gst} recuperada del caché del lote.")
+                return ruta_cache
 
-        # No existe caché local de plantillas.
-        # Drive es siempre la fuente oficial.
+        codigo_limpio = str(codigo_gst).upper().strip()
+        patron_gst = r"(?i)\bGST[\s_-]*0*(\d+)(?!\d)"
+
+        match_codigo = re.search(patron_gst, codigo_limpio)
+        if not match_codigo:
+            raise ValueError(f"Código GST inválido: '{codigo_gst}'")
+
+        numero_gst = int(match_codigo.group(1))
+
+        # Drive sigue siendo siempre la fuente oficial.
         os.makedirs(TEMP_PLANTILLAS_DIR, exist_ok=True)
+        raiz_id = DriveConnector.obtener_id_carpeta_plantillas()
+        service = DriveConnector._obtener_servicio_drive()
 
-        # ------------------------------------------------------
-        # DRIVE: FUENTE OFICIAL
-        # ------------------------------------------------------
+        mime_carpeta = "application/vnd.google-apps.folder"
+        carpetas_excluidas = {
+            "REPORTE FOTOGRAFICO",
+            "Z-DOCTOS.INFORMATIVOS",
+            "SEDENA-SICT",
+            "OBSOLETOS",
+        }
 
-        folder_id = (
-            DriveConnector
-            .obtener_id_carpeta_plantillas()
-        )
+        def nombre_normalizado(nombre: str) -> str:
+            return " ".join(str(nombre).upper().strip().split())
 
-        service = (
-            DriveConnector
-            ._obtener_servicio_drive()
-        )
+        def coincide_gst(nombre: str) -> bool:
+            if not nombre.lower().endswith((".xlsx", ".xlsm")):
+                return False
+            coincidencias = re.findall(patron_gst, nombre)
+            return any(int(n) == numero_gst for n in coincidencias)
 
-        codigo_query = (
-            DriveConnector
-            ._escapar_query(
-                codigo_limpio
+        def listar_hijos(parent_id: str):
+            items = []
+            page_token = None
+            while True:
+                resultado = service.files().list(
+                    q=f"'{parent_id}' in parents and trashed = false",
+                    pageSize=1000,
+                    fields="nextPageToken,files(id,name,mimeType,modifiedTime)",
+                    pageToken=page_token,
+                    supportsAllDrives=True,
+                    includeItemsFromAllDrives=True,
+                ).execute()
+                items.extend(resultado.get("files", []))
+                page_token = resultado.get("nextPageToken")
+                if not page_token:
+                    break
+            return items
+
+        # 1) Rápido: solo archivos directamente dentro de la raíz.
+        print(f"🔎 Buscando plantilla {codigo_gst} en nivel principal de Drive...")
+        items_raiz = listar_hijos(raiz_id)
+
+        candidatos_superficiales = [
+            item for item in items_raiz
+            if str(item.get("mimeType", "")) != mime_carpeta
+            and coincide_gst(str(item.get("name", "")))
+        ]
+
+        if candidatos_superficiales:
+            candidatos_superficiales.sort(
+                key=lambda x: str(x.get("modifiedTime", "")),
+                reverse=True,
             )
-        )
-
-        query = (
-            f"'{folder_id}' in parents "
-            f"and name contains '{codigo_query}' "
-            f"and trashed = false"
-        )
-
-        results = (
-            service
-            .files()
-            .list(
-                q=query,
-                pageSize=20,
-                fields=(
-                    "files("
-                    "id,"
-                    "name,"
-                    "mimeType,"
-                    "modifiedTime"
-                    ")"
-                ),
-                orderBy="modifiedTime desc",
-                supportsAllDrives=True,
-                includeItemsFromAllDrives=True,
+            item = candidatos_superficiales[0]
+            print(
+                f"⚡ Plantilla encontrada en nivel principal para {codigo_gst}: "
+                f"'{item['name']}'"
             )
-            .execute()
-        )
+        else:
+            # 2) Respaldo: recorrer subcarpetas, excepto ramas excluidas.
+            print(
+                f"🔎 No apareció {codigo_gst} en el nivel principal. "
+                "Buscando en subcarpetas permitidas..."
+            )
 
-        items = results.get(
-            "files",
-            []
-        )
+            candidatos = []
+            carpetas_pendientes = []
 
-        # Solo Excel
-        items = [
-            item
-            for item in items
-            if item[
-                "name"
-            ].lower().endswith(
-                (
-                    ".xlsx",
-                    ".xlsm",
+            for hijo in items_raiz:
+                if str(hijo.get("mimeType", "")) != mime_carpeta:
+                    continue
+                nombre = nombre_normalizado(str(hijo.get("name", "")))
+                if nombre in carpetas_excluidas:
+                    print(f"⛔ Carpeta excluida: '{hijo.get('name', '')}'")
+                    continue
+                carpetas_pendientes.append(hijo["id"])
+
+            visitadas = set()
+            while carpetas_pendientes:
+                parent_id = carpetas_pendientes.pop()
+                if parent_id in visitadas:
+                    continue
+                visitadas.add(parent_id)
+
+                for hijo in listar_hijos(parent_id):
+                    mime_type = str(hijo.get("mimeType", ""))
+                    nombre = str(hijo.get("name", ""))
+
+                    if mime_type == mime_carpeta:
+                        if nombre_normalizado(nombre) in carpetas_excluidas:
+                            print(f"⛔ Carpeta excluida: '{nombre}'")
+                            continue
+                        carpetas_pendientes.append(hijo["id"])
+                        continue
+
+                    if coincide_gst(nombre):
+                        candidatos.append(hijo)
+
+            if not candidatos:
+                raise FileNotFoundError(
+                    f"No se encontró ninguna plantilla para '{codigo_gst}' "
+                    "ni en el nivel principal ni en las subcarpetas permitidas."
                 )
+
+            candidatos.sort(
+                key=lambda x: str(x.get("modifiedTime", "")),
+                reverse=True,
             )
-        ]
-
-        if not items:
-
-            raise FileNotFoundError(
-                "No se encontró ninguna "
-                "plantilla para el código "
-                f"'{codigo_gst}' "
-                "en Google Drive."
+            item = candidatos[0]
+            print(
+                f"📌 Plantilla más reciente encontrada en profundidad para "
+                f"{codigo_gst}: '{item['name']}' "
+                f"({item.get('modifiedTime', 'sin fecha')})"
             )
 
-        # La más recientemente modificada.
-        item = items[0]
+        file_id = item["id"]
+        file_name = item["name"]
+        ruta_destino = os.path.join(TEMP_PLANTILLAS_DIR, file_name)
 
-        file_id = item[
-            "id"
-        ]
-
-        file_name = item[
-            "name"
-        ]
-
-        ruta_destino = os.path.join(
-            TEMP_PLANTILLAS_DIR,
-            file_name
-        )
-
-        print(
-            "📥 Descargando plantilla "
-            f"oficial '{file_name}'..."
-        )
-
-        request = (
-            service
-            .files()
-            .get_media(
-                fileId=file_id,
-                supportsAllDrives=True,
-            )
+        print(f"📥 Descargando plantilla oficial '{file_name}'...")
+        request = service.files().get_media(
+            fileId=file_id,
+            supportsAllDrives=True,
         )
 
         fh = io.BytesIO()
-
-        downloader = (
-            MediaIoBaseDownload(
-                fh,
-                request
-            )
-        )
-
+        downloader = MediaIoBaseDownload(fh, request)
         done = False
-
         while not done:
+            _, done = downloader.next_chunk()
 
-            _, done = (
-                downloader
-                .next_chunk()
-            )
+        with open(ruta_destino, "wb") as archivo:
+            archivo.write(fh.getvalue())
 
-        with open(
-            ruta_destino,
-            "wb"
-        ) as archivo:
-
-            archivo.write(
-                fh.getvalue()
-            )
+        if DriveConnector._cache_lote_activo:
+            DriveConnector._cache_plantillas_lote[clave_cache] = ruta_destino
+            print(f"⚡ Plantilla {codigo_gst} guardada en caché hasta terminar el lote.")
 
         return ruta_destino
 

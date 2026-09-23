@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import copy
 from pathlib import Path
 
 from DOMINIO.mapeador_ia import MapeadorIA
@@ -11,11 +12,41 @@ import time
 
 
 class GestorMapas:
+    # Caché VOLÁTIL de mapas. Solo existe durante un lote.
+    _cache_lote_activo = False
+    _cache_mapas_lote = {}
+
+    @staticmethod
+    def iniciar_cache_lote():
+        GestorMapas._cache_lote_activo = True
+        GestorMapas._cache_mapas_lote = {}
+        print("⚡ Caché temporal de mapas iniciado.")
+
+    @staticmethod
+    def limpiar_cache_lote():
+        GestorMapas._cache_mapas_lote = {}
+        GestorMapas._cache_lote_activo = False
+        print("🧹 Caché temporal de mapas limpiado.")
+
+    @staticmethod
+    def _clave_cache(codigo_gst, nombre_mapa):
+        return (str(codigo_gst).upper().strip(), str(nombre_mapa))
+
+    @staticmethod
+    def _guardar_cache(codigo_gst, nombre_mapa, mapa):
+        if not GestorMapas._cache_lote_activo:
+            return
+        copia = copy.deepcopy(mapa)
+        copia.pop("_reutilizado_desde_drive", None)
+        GestorMapas._cache_mapas_lote[
+            GestorMapas._clave_cache(codigo_gst, nombre_mapa)
+        ] = copia
+
     """
     Gestor V2.2 sin caché local.
 
     Drive es la única fuente persistente de mapas.
-    La firma de la plantilla y la firma estructural del ERP forman
+    La firma de la plantilla y la firma estructural del ERP (incluido el patrón de ocupación) forman
     el nombre exacto del mapa; si cambia cualquiera, el mapa anterior
     deja de ser candidato automáticamente.
     """
@@ -114,6 +145,21 @@ class GestorMapas:
             firma_origen,
         )
 
+        if not forzar_nuevo and GestorMapas._cache_lote_activo:
+            clave_cache = GestorMapas._clave_cache(codigo_gst, nombre_mapa)
+            mapa_cache = GestorMapas._cache_mapas_lote.get(clave_cache)
+            if mapa_cache is not None:
+                mapa_cache = copy.deepcopy(mapa_cache)
+                # Ya fue validado/recuperado o creado y subido durante este mismo lote.
+                mapa_cache["_reutilizado_desde_drive"] = True
+                print(f"⚡ Mapa recuperado del caché del lote: {nombre_mapa}")
+                print("🚫 Drive/Gemini NO serán llamados para este mapa.")
+                print(
+                    f"⏱️ TOTAL GestorMapas.obtener_o_crear: "
+                    f"{time.perf_counter() - _t_mapa_total:.3f} s"
+                )
+                return mapa_cache
+
         print("\n" + "=" * 78)
         print("MAPA ESTRUCTURAL V2.2")
         print("=" * 78)
@@ -133,6 +179,8 @@ class GestorMapas:
             )
             print(f"⏱️ Consulta + descarga mapa Drive: {time.perf_counter() - _t:.3f} s")
             if mapa_drive is not None:
+                GestorMapas._guardar_cache(codigo_gst, nombre_mapa, mapa_drive)
+                print("⚡ Mapa guardado en caché hasta terminar el lote.")
                 print("🚫 Gemini NO será llamado.")
                 print(
                     f"⏱️ TOTAL GestorMapas.obtener_o_crear: "
@@ -170,6 +218,10 @@ class GestorMapas:
             nombre_mapa,
             mapa,
         )
+
+        # Solo DESPUÉS de persistirlo correctamente en Drive entra al caché.
+        GestorMapas._guardar_cache(codigo_gst, nombre_mapa, mapa)
+        print("⚡ Mapa nuevo guardado en caché hasta terminar el lote.")
 
         # Este mapa acaba de ser creado y validado por primera vez.
         # El GeneradorExcel hará la ruta completa de seguridad en esta

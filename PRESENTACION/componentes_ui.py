@@ -18,7 +18,7 @@ class ComponentesUI:
             with ui.expansion(
                 f" {nombre_carpeta} ({num_archivos} archivos)", icon="folder"
             ).classes(
-                "w-full bg-blue-50 border border-blue-200 rounded-lg mb-2 text-blue-900 font-semibold"
+                "w-full bg-white border border-[#DFE4EF] rounded-xl mb-2 text-[#253B83] font-semibold"
             ):
 
                 with ui.column().classes("w-full p-2 bg-white gap-1"):
@@ -57,7 +57,7 @@ class ComponentesUI:
 
                     ui.table(
                         columns=columnas, rows=lista_archivos, row_key="archivo"
-                    ).classes("w-full border")
+                    ).classes("geotest-table w-full")
 
                     with ui.row().classes("w-full justify-end mt-2"):
                         ui.button(

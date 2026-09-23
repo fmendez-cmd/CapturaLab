@@ -35,20 +35,61 @@ class ValidadorMapa:
         return pythoncom, win32com.client
 
     @staticmethod
+    def _normalizar_nombre_hoja(nombre: str) -> str:
+        """
+        Normaliza el nombre únicamente para decidir si una hoja es
+        de validación. No altera el nombre real de Excel.
+        """
+        import unicodedata
+
+        texto = unicodedata.normalize("NFKD", str(nombre))
+        texto = "".join(
+            ch for ch in texto
+            if not unicodedata.combining(ch)
+        )
+        return " ".join(texto.upper().split())
+
+    @staticmethod
     def _buscar_hoja_erp(libro):
-        hojas = []
+        hojas_erp = []
+        hojas_validacion = []
 
         for i in range(1, libro.Worksheets.Count + 1):
             hoja = libro.Worksheets(i)
-            if "ERP" in str(hoja.Name).upper():
-                hojas.append(hoja)
+            nombre_real = str(hoja.Name)
+            nombre = ValidadorMapa._normalizar_nombre_hoja(nombre_real)
 
-        if len(hojas) != 1:
+            if "ERP" not in nombre:
+                continue
+
+            # Una hoja cuyo nombre indica VALIDACION es auxiliar.
+            # No debe participar como destino de captura.
+            if "VALIDACION" in nombre:
+                hojas_validacion.append(nombre_real)
+                continue
+
+            hojas_erp.append(hoja)
+
+        if not hojas_erp:
+            detalle = (
+                f" Se ignoraron hojas auxiliares de validación: "
+                f"{hojas_validacion}."
+                if hojas_validacion
+                else ""
+            )
             raise ValueError(
-                "Debe existir exactamente una hoja cuyo nombre contenga ERP."
+                "La plantilla no contiene una hoja ERP de captura válida."
+                + detalle
             )
 
-        return hojas[0]
+        if len(hojas_erp) > 1:
+            raise ValueError(
+                "La plantilla contiene más de una hoja ERP de captura "
+                "posible. No es seguro elegir automáticamente. "
+                f"Coincidencias: {[str(h.Name) for h in hojas_erp]}"
+            )
+
+        return hojas_erp[0]
 
     @staticmethod
     def _texto(valor) -> str:
@@ -585,10 +626,37 @@ class ValidadorMapa:
                     f"La traslación dominante lleva {origen} -> {destino} fuera de la zona segura."
                 )
 
+            # IMPORTANTE:
+            # La traslación física puede caer en una coordenada secundaria
+            # de un MergeArea (por ejemplo E123 dentro de E122:E123).
+            # Para escribir con Excel COM necesitamos usar el top-left real
+            # de esa misma área combinada, SIN cambiar la traslación dominante
+            # ni compactar/mover las demás posiciones.
+            celda_destino = hoja_destino.Range(destino).Cells(1, 1)
+            destino_real = ValidadorMapa._top_left(celda_destino)
+            destino_real_addr = str(
+                destino_real.Address
+            ).replace("$", "").upper()
+
+            if not ValidadorMapa._destino_dentro_zona(
+                destino_real_addr,
+                mapa["zona_captura"],
+            ):
+                raise ValueError(
+                    f"La celda combinada correspondiente a {origen} -> {destino} "
+                    f"tiene top-left {destino_real_addr} fuera de la zona segura."
+                )
+
             operaciones.append({
                 "origen": origen,
-                "destino": destino,
-                "descripcion": "Reconstrucción geométrica determinista V2.2",
+                "destino": destino_real_addr,
+                "descripcion": (
+                    "Reconstrucción geométrica determinista V2.2"
+                    if destino_real_addr == destino
+                    else
+                    f"Reconstrucción geométrica V2.2; {destino} normalizado "
+                    f"al top-left combinado {destino_real_addr}"
+                ),
             })
 
         nuevo = dict(mapa)
@@ -596,6 +664,12 @@ class ValidadorMapa:
         nuevo["operaciones"] = operaciones
         nuevo["ignorados"] = []
         nuevo["confianza"] = max(float(nuevo.get("confianza", 0)), 0.95)
+        normalizadas_merge = sum(
+            1
+            for op in operaciones
+            if "normalizado al top-left combinado" in str(op.get("descripcion", ""))
+        )
+
         nuevo["diagnostico_v22"] = {
             "desplazamiento_filas": dr,
             "desplazamiento_columnas": dc,
@@ -604,7 +678,14 @@ class ValidadorMapa:
             "proporcion_dominante": proporcion,
             "celdas_origen": len(source),
             "operaciones_reconstruidas": len(operaciones),
+            "destinos_merge_normalizados": normalizadas_merge,
         }
+
+        if normalizadas_merge:
+            print(
+                f"ℹ️ Destinos dentro de celdas combinadas normalizados "
+                f"al top-left: {normalizadas_merge}"
+            )
         return nuevo
 
     @staticmethod

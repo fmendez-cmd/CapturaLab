@@ -94,26 +94,72 @@ class MapeadorIA:
     # HELPERS
     # ============================================================
     @staticmethod
+    def _normalizar_nombre_hoja(nombre: str) -> str:
+        """
+        Normaliza el nombre únicamente para decidir si una hoja es
+        de validación. No altera el nombre real de Excel.
+        """
+        import unicodedata
+
+        texto = unicodedata.normalize("NFKD", str(nombre))
+        texto = "".join(
+            ch for ch in texto
+            if not unicodedata.combining(ch)
+        )
+        return " ".join(texto.upper().split())
+
+    @staticmethod
     def _buscar_hoja_erp(libro):
-        hojas = []
+        hojas_erp = []
+        hojas_validacion = []
 
         for i in range(1, libro.Worksheets.Count + 1):
             hoja = libro.Worksheets(i)
-            if "ERP" in str(hoja.Name).upper():
-                hojas.append(hoja)
+            nombre_real = str(hoja.Name)
+            nombre = MapeadorIA._normalizar_nombre_hoja(nombre_real)
 
-        if not hojas:
+            if "ERP" not in nombre:
+                continue
+
+            # Las hojas de VALIDACION ERP son auxiliares y nunca son
+            # el área de captura que debe utilizar el mapeador.
+            if "VALIDACION" in nombre:
+                hojas_validacion.append(nombre_real)
+                continue
+
+            hojas_erp.append(hoja)
+
+        if not hojas_erp:
+            detalle = (
+                f" Se ignoraron hojas auxiliares de validación: "
+                f"{hojas_validacion}."
+                if hojas_validacion
+                else ""
+            )
             raise ValueError(
-                "La plantilla no contiene una hoja cuyo nombre incluya ERP."
+                "La plantilla no contiene una hoja ERP de captura válida."
+                + detalle
             )
 
-        if len(hojas) > 1:
+        if len(hojas_erp) > 1:
             raise ValueError(
-                "La plantilla contiene más de una hoja ERP. "
-                f"Coincidencias: {[str(h.Name) for h in hojas]}"
+                "La plantilla contiene más de una hoja ERP de captura "
+                "posible. No es seguro elegir automáticamente. "
+                f"Coincidencias: {[str(h.Name) for h in hojas_erp]}"
             )
 
-        return hojas[0]
+        if hojas_validacion:
+            print(
+                "ℹ️ Hojas ERP auxiliares de validación ignoradas: "
+                f"{hojas_validacion}"
+            )
+
+        print(
+            f"📄 Hoja ERP de captura seleccionada: "
+            f"'{str(hojas_erp[0].Name)}'"
+        )
+
+        return hojas_erp[0]
 
     @staticmethod
     def _to_matrix(valor: Any) -> list[list[Any]]:
@@ -856,12 +902,21 @@ REGLAS OBLIGATORIAS:
             raise RuntimeError("Instala: pip install -U google-genai pydantic") from exc
 
         verificar_cancelacion()
+
+        _t_total_gemini = time.perf_counter()
+
+        _t = time.perf_counter()
         contexto = MapeadorIA.construir_contexto(codigo_gst, ruta_erp, ruta_plantilla)
+        _dt_contexto = time.perf_counter() - _t
+
         verificar_cancelacion()
+
+        _t = time.perf_counter()
         prompt = (
             "Genera el mapa estructural completo CELDA->CELDA.\n\n"
             + json.dumps(contexto, ensure_ascii=False, separators=(",", ":"), default=str)
         )
+        _dt_prompt = time.perf_counter() - _t
 
         print("\n" + "=" * 78)
         print("GENERANDO MAPA ESTRUCTURAL V2.2 CON GEMINI")
@@ -872,6 +927,8 @@ REGLAS OBLIGATORIAS:
         print(f"Celdas no vacías origen: {len(contexto['origen']['celdas_no_vacias'])}")
         print(f"Dependencias de fórmulas: {len(contexto['dependencias_formulas'])}")
         print(f"Tamaño contexto: {len(prompt):,} caracteres")
+        print(f"⏱️ Construir contexto Excel: {_dt_contexto:.3f} s")
+        print(f"⏱️ Serializar prompt: {_dt_prompt:.3f} s")
         print("=" * 78)
 
         cliente = genai.Client(api_key=api_key)
@@ -883,6 +940,7 @@ REGLAS OBLIGATORIAS:
             intento += 1
             try:
                 print(f"🤖 Gemini — intento {intento}...")
+                _t_llamada = time.perf_counter()
                 respuesta = cliente.models.generate_content(
                     model=MapeadorIA.MODELO,
                     contents=prompt,
@@ -894,7 +952,9 @@ REGLAS OBLIGATORIAS:
                         automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
                     ),
                 )
+                _dt_llamada = time.perf_counter() - _t_llamada
                 print(f"✅ Gemini respondió correctamente en el intento {intento}.")
+                print(f"⏱️ Llamada Gemini: {_dt_llamada:.3f} s")
                 break
             except Exception as error:
                 if MapeadorIA._es_cuota_diaria_agotada(error):
@@ -915,6 +975,7 @@ REGLAS OBLIGATORIAS:
                     time.sleep(pausa)
                 espera = min(5, espera * 2)
 
+        _t = time.perf_counter()
         if getattr(respuesta, "parsed", None) is not None:
             parsed = respuesta.parsed
             data = parsed.model_dump() if hasattr(parsed, "model_dump") else dict(parsed)
@@ -923,11 +984,21 @@ REGLAS OBLIGATORIAS:
             if not texto:
                 raise RuntimeError("Gemini no devolvió ningún mapa.")
             data = json.loads(texto)
+        _dt_parseo = time.perf_counter() - _t
+        print(f"⏱️ Parsear respuesta Gemini: {_dt_parseo:.3f} s")
 
         data["version_mapa"] = MapeadorIA.VERSION_MAPA
         data["gst"] = codigo_gst
         data["archivo_plantilla"] = Path(ruta_plantilla).name
         data["hoja_destino"] = contexto["destino"]["hoja"]
         data["zona_captura"] = contexto["destino"]["zona"]
+        _t = time.perf_counter()
         data["firma_estructura_origen"] = MapeadorIA.firma_estructura_origen(ruta_erp)
+        _dt_firma_final = time.perf_counter() - _t
+
+        print(f"⏱️ Firma estructura ERP final: {_dt_firma_final:.3f} s")
+        print(
+            f"⏱️ TOTAL generar_mapa (incluye Gemini): "
+            f"{time.perf_counter() - _t_total_gemini:.3f} s"
+        )
         return data
