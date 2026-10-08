@@ -932,15 +932,22 @@ REGLAS OBLIGATORIAS:
         print("=" * 78)
 
         cliente = genai.Client(api_key=api_key)
-        intento = 0
-        espera = 5
 
-        while True:
+        # ========================================================
+        # GEMINI — MÁXIMO 3 INTENTOS POR ENSAYE
+        # ========================================================
+        MAX_INTENTOS_GEMINI = 3
+        espera = 5
+        respuesta = None
+        ultimo_error = None
+
+        for intento in range(1, MAX_INTENTOS_GEMINI + 1):
             verificar_cancelacion()
-            intento += 1
+
             try:
-                print(f"🤖 Gemini — intento {intento}...")
+                print(f"🤖 Gemini — intento {intento}/{MAX_INTENTOS_GEMINI}...")
                 _t_llamada = time.perf_counter()
+
                 respuesta = cliente.models.generate_content(
                     model=MapeadorIA.MODELO,
                     contents=prompt,
@@ -949,31 +956,76 @@ REGLAS OBLIGATORIAS:
                         response_mime_type="application/json",
                         response_schema=RespuestaMapaIA,
                         temperature=0.0,
-                        automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
+                        automatic_function_calling=types.AutomaticFunctionCallingConfig(
+                            disable=True
+                        ),
                     ),
                 )
+
                 _dt_llamada = time.perf_counter() - _t_llamada
-                print(f"✅ Gemini respondió correctamente en el intento {intento}.")
+
+                # Una llamada solo cuenta como exitosa si Gemini devolvió
+                # contenido utilizable (parsed o texto).
+                tiene_parsed = getattr(respuesta, "parsed", None) is not None
+                tiene_texto = bool((getattr(respuesta, "text", "") or "").strip())
+
+                if not tiene_parsed and not tiene_texto:
+                    raise RuntimeError("Gemini respondió sin contenido.")
+
+                print(
+                    f"✅ Gemini respondió correctamente en el intento "
+                    f"{intento}/{MAX_INTENTOS_GEMINI}."
+                )
                 print(f"⏱️ Llamada Gemini: {_dt_llamada:.3f} s")
                 break
+
             except Exception as error:
+                ultimo_error = error
+
+                print(
+                    f"⚠️ Gemini falló en el intento "
+                    f"{intento}/{MAX_INTENTOS_GEMINI}: "
+                    f"{type(error).__name__}: {error}"
+                )
+
+                # La cuota diaria agotada no se solucionará reintentando.
                 if MapeadorIA._es_cuota_diaria_agotada(error):
                     raise RuntimeError(
                         "Se agotó la cuota diaria de Gemini para "
-                        f"{MapeadorIA.MODELO}. No se harán reintentos automáticos."
+                        f"{MapeadorIA.MODELO}."
                     ) from error
-                if not MapeadorIA._es_error_temporal(error):
-                    raise
+
+                # Al tercer fallo se abandona SOLO este ensaye.
+                # WorkflowService captura esta excepción, registra la
+                # incidencia y continúa con el siguiente archivo.
+                if intento >= MAX_INTENTOS_GEMINI:
+                    print(
+                        "❌ Gemini no respondió después de 3 intentos. "
+                        "Se continuará con el siguiente ensaye."
+                    )
+                    raise RuntimeError(
+                        "No fue posible obtener respuesta de Gemini "
+                        "después de 3 intentos."
+                    ) from error
+
                 jitter = random.uniform(0, 2.0)
                 pausa = min(5, espera) + jitter
-                print(f"⚠️ Error temporal de Gemini: {type(error).__name__}: {error}")
-                print(f"⏳ Reintentando automáticamente en {pausa:.0f} segundos...")
+                print(f"⏳ Nuevo intento en {pausa:.0f} segundos...")
+
                 if cancel_event is not None:
                     if cancel_event.wait(timeout=pausa):
-                        raise InterruptedError("Procesamiento cancelado por el usuario.")
+                        raise InterruptedError(
+                            "Procesamiento cancelado por el usuario."
+                        )
                 else:
-                    time.sleep(pausa)
+                    esperar_cancelable(pausa)
+
                 espera = min(5, espera * 2)
+
+        if respuesta is None:
+            raise RuntimeError(
+                "No fue posible obtener respuesta de Gemini después de 3 intentos."
+            ) from ultimo_error
 
         _t = time.perf_counter()
         if getattr(respuesta, "parsed", None) is not None:

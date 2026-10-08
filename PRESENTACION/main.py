@@ -2,6 +2,10 @@ import os
 import sys
 import base64
 import asyncio
+import multiprocessing as mp
+import queue
+import subprocess
+import copy
 from pathlib import Path
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -24,7 +28,8 @@ sys.path.append(
 )
 
 from DOMINIO.parser_erp import ParserERP
-from APLICACION.workflow_service import WorkflowService
+from APLICACION.proceso_worker import ejecutar_lote_en_proceso
+from INFRAESTRUCTURA.config_rutas import DOCUMENTOS_DIR
 from PRESENTACION.componentes_ui import ComponentesUI
 from PRESENTACION.estilo_geotest import aplicar_estilo_geotest
 from PRESENTACION.resumen_procesamiento import ResumenProcesamientoUI
@@ -46,9 +51,15 @@ def fecha_encabezado():
 
 carpetas_dict = {}
 
-workflow_service = WorkflowService()
-
 procesando = False
+
+# Proceso hijo que ejecuta exclusivamente el lote actual.
+# Terminarlo NO termina el servidor NiceGUI.
+proceso_trabajo = None
+cola_progreso_trabajo = None
+cola_resultado_trabajo = None
+cancelacion_forzada = False
+archivos_excel_antes_lote = set()
 
 
 # ============================================================
@@ -407,33 +418,83 @@ def limpiar_sin_notificacion():
 # CANCELAR
 # ============================================================
 
+def _listar_excel_resultados() -> set[str]:
+    """Snapshot de Excel existentes antes/después de un lote."""
+    raiz = Path(DOCUMENTOS_DIR)
+    if not raiz.exists():
+        return set()
+    return {
+        str(p.resolve())
+        for p in raiz.rglob("*.xlsx")
+        if p.is_file()
+    }
+
+
+def _eliminar_excel_nuevos_del_lote():
+    """Elimina únicamente Excel que no existían al iniciar este lote."""
+    actuales = _listar_excel_resultados()
+    nuevos = actuales - archivos_excel_antes_lote
+    for ruta in nuevos:
+        try:
+            Path(ruta).unlink(missing_ok=True)
+            print(f"🗑️ Excel eliminado por cancelación: {ruta}")
+        except Exception as error:
+            print(f"⚠️ No se pudo eliminar {ruta}: {error}")
+
+
+def _matar_proceso_trabajo():
+    """Mata SOLO el proceso hijo del lote y sus procesos hijos.
+
+    En Windows se usa taskkill /T /F para incluir, por ejemplo, un Excel
+    iniciado por ese worker, sin matar el proceso del servidor NiceGUI.
+    """
+    global proceso_trabajo
+
+    proceso = proceso_trabajo
+    if proceso is None or not proceso.is_alive():
+        return
+
+    pid = proceso.pid
+    print(f"🛑 Cancelación inmediata del lote. PID worker: {pid}")
+
+    try:
+        if os.name == "nt" and pid:
+            subprocess.run(
+                ["taskkill", "/PID", str(pid), "/T", "/F"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                timeout=5,
+                check=False,
+            )
+        else:
+            proceso.terminate()
+    except Exception as error:
+        print(f"⚠️ taskkill falló: {error}")
+        try:
+            proceso.terminate()
+        except Exception:
+            pass
+
+
 def cancelar_procesamiento():
+    global cancelacion_forzada
 
     if not procesando:
         return
 
-    workflow_service.solicitar_cancelacion()
+    cancelacion_forzada = True
 
-    titulo_modal.set_text(
-        "Cancelando procesamiento..."
-    )
-
-    etapa_modal.set_text(
-        "Esperando a que el ensaye actual "
-        "termine de forma segura."
-    )
-
+    titulo_modal.set_text("Cancelando procesamiento...")
+    etapa_modal.set_text("Deteniendo el trabajo actual.")
     detalle_modal.set_text(
-        "Los mapas generados se conservarán. "
-        "Los Excel de este lote serán eliminados."
+        "El servidor seguirá funcionando. Los mapas ya guardados se conservarán."
     )
-
     boton_cancelar.disable()
+    spinner_modal.set_visibility(True)
 
-    spinner_modal.set_visibility(
-        True
-    )
-
+    # Mata exclusivamente el worker de este lote; NO el servidor NiceGUI.
+    _matar_proceso_trabajo()
 
 # ============================================================
 # PROGRESO DESDE WORKFLOW
@@ -596,167 +657,190 @@ async def actualizar_modal_progreso(
 # ============================================================
 
 async def ejecutar_procesamiento():
-
     global procesando
+    global proceso_trabajo
+    global cola_progreso_trabajo
+    global cola_resultado_trabajo
+    global cancelacion_forzada
+    global archivos_excel_antes_lote
 
     if procesando:
         return
 
     if not carpetas_dict:
-
         ui.notify(
-            "Por favor importa al menos una carpeta "
-            "antes de procesar.",
+            "Por favor importa al menos una carpeta antes de procesar.",
             type="warning",
         )
-
         return
 
-    # ========================================================
-    # CALCULAR TOTAL
-    # ========================================================
-
-    total = sum(
-        len(archivos)
-        for archivos
-        in carpetas_dict.values()
-    )
-
-    total_carpetas_lote = len(
-        carpetas_dict
-    )
+    total = sum(len(archivos) for archivos in carpetas_dict.values())
+    total_carpetas_lote = len(carpetas_dict)
 
     if total <= 0:
-
-        ui.notify(
-            "No hay archivos para procesar.",
-            type="warning",
-        )
-
+        ui.notify("No hay archivos para procesar.", type="warning")
         return
 
     procesando = True
+    cancelacion_forzada = False
+    archivos_excel_antes_lote = _listar_excel_resultados()
 
-    workflow_service.preparar_procesamiento()
-
-    # ========================================================
-    # PREPARAR MODAL
-    # ========================================================
-
-    titulo_modal.set_text(
-        f"Preparando {total} ensaye(s)..."
-    )
-
-    gst_modal.set_text(
-        ""
-    )
-
-    archivo_modal.set_text(
-        ""
-    )
-
-    etapa_modal.set_text(
-        "Preparando procesamiento..."
-    )
-
+    titulo_modal.set_text(f"Preparando {total} ensaye(s)...")
+    gst_modal.set_text("")
+    archivo_modal.set_text("")
+    etapa_modal.set_text("Preparando procesamiento...")
     detalle_modal.set_text(
-        "No cierres esta pestaña mientras "
-        "se procesan los archivos."
+        "No cierres esta pestaña mientras se procesan los archivos."
     )
-
-    porcentaje_modal.set_text(
-        "0%"
-    )
-
-    barra_progreso.set_value(
-        0
-    )
-
-    spinner_modal.set_visibility(
-        True
-    )
-
+    porcentaje_modal.set_text("0%")
+    barra_progreso.set_value(0)
+    spinner_modal.set_visibility(True)
     boton_cancelar.enable()
-
     boton_procesar.disable()
-
     dialogo_proceso.open()
 
-    # ========================================================
-    # EVENT LOOP
-    # ========================================================
-
-    loop = asyncio.get_running_loop()
-
-    callback_progreso = (
-        crear_callback_progreso(
-            loop
-        )
-    )
-
     try:
+        # Windows necesita spawn. El WorkflowService se crea DENTRO del hijo.
+        contexto_mp = mp.get_context("spawn")
+        cola_progreso_trabajo = contexto_mp.Queue()
+        cola_resultado_trabajo = contexto_mp.Queue()
 
-        # ====================================================
-        # EJECUTAR EN WORKER THREAD
-        # ====================================================
-
-        resultado = await run.io_bound(
-            workflow_service.procesar_lote_carpetas,
-            carpetas_dict,
-            callback_progreso,
+        proceso_trabajo = contexto_mp.Process(
+            target=ejecutar_lote_en_proceso,
+            args=(
+                copy.deepcopy(carpetas_dict),
+                cola_progreso_trabajo,
+                cola_resultado_trabajo,
+            ),
+            name="LabCaptura-Lote",
+            daemon=False,
         )
+        proceso_trabajo.start()
+        print(f"🚀 Lote iniciado en proceso independiente PID={proceso_trabajo.pid}")
 
-        estado = resultado.get(
-            "status"
-        )
+        resultado = None
+        error_worker = None
 
-        # ====================================================
-        # ÉXITO
-        # ====================================================
+        while True:
+            # Vaciar todos los mensajes de progreso disponibles.
+            while True:
+                try:
+                    datos = cola_progreso_trabajo.get_nowait()
+                except queue.Empty:
+                    break
+                except (EOFError, OSError):
+                    break
+                else:
+                    await actualizar_modal_progreso(datos)
+
+            # Buscar resultado final sin bloquear la interfaz.
+            try:
+                mensaje = cola_resultado_trabajo.get_nowait()
+            except queue.Empty:
+                mensaje = None
+            except (EOFError, OSError):
+                mensaje = None
+
+            if mensaje is not None:
+                if mensaje.get("tipo") == "resultado":
+                    resultado = mensaje.get("resultado")
+                else:
+                    error_worker = mensaje
+                break
+
+            # Cancelar significa terminar el worker; no esperamos al ensaye.
+            if cancelacion_forzada:
+                if proceso_trabajo.is_alive():
+                    _matar_proceso_trabajo()
+                break
+
+            # Si murió sin mandar resultado, salir y reportar error.
+            if not proceso_trabajo.is_alive():
+                # Damos un instante al feeder de la Queue para entregar
+                # un resultado que haya sido escrito justo antes de salir.
+                await asyncio.sleep(0.10)
+                try:
+                    mensaje = cola_resultado_trabajo.get_nowait()
+                except Exception:
+                    mensaje = None
+
+                if mensaje and mensaje.get("tipo") == "resultado":
+                    resultado = mensaje.get("resultado")
+                elif mensaje:
+                    error_worker = mensaje
+                else:
+                    error_worker = {
+                        "error": (
+                            f"El proceso de trabajo terminó sin resultado "
+                            f"(exitcode={proceso_trabajo.exitcode})."
+                        )
+                    }
+                break
+
+            await asyncio.sleep(0.10)
+
+        # Recolectar el proceso sin bloquear durante mucho tiempo.
+        if proceso_trabajo is not None:
+            await run.io_bound(proceso_trabajo.join, 1.0)
+
+        if cancelacion_forzada:
+            # El worker ya está muerto. Ahora retiramos cualquier Excel nuevo
+            # que haya alcanzado a crear este lote. Los mapas NO se tocan.
+            await run.io_bound(_eliminar_excel_nuevos_del_lote)
+
+            titulo_modal.set_text("Procesamiento cancelado")
+            etapa_modal.set_text("El trabajo fue detenido.")
+            detalle_modal.set_text(
+                "El servidor continúa funcionando y puedes iniciar otro procesamiento."
+            )
+            spinner_modal.set_visibility(False)
+            barra_progreso.set_value(0)
+            porcentaje_modal.set_text("")
+            dialogo_proceso.close()
+            ui.notify(
+                "Procesamiento cancelado.",
+                type="warning",
+                duration=4000,
+            )
+            return
+
+        if error_worker is not None:
+            print("=" * 80)
+            print("ERROR EN PROCESO DE TRABAJO")
+            print(error_worker.get("error", "Error desconocido"))
+            if error_worker.get("traceback"):
+                print(error_worker["traceback"])
+            print("=" * 80)
+            raise RuntimeError(
+                error_worker.get("error", "El worker terminó con error.")
+            )
+
+        if not isinstance(resultado, dict):
+            raise RuntimeError("El proceso terminó sin devolver un resultado válido.")
+
+        estado = resultado.get("status")
 
         if estado == "exito":
-
-            barra_progreso.set_value(
-                1
-            )
-
-            porcentaje_modal.set_text(
-                "100%"
-            )
-
-            titulo_modal.set_text(
-                "Procesamiento terminado"
-            )
-
+            barra_progreso.set_value(1)
+            porcentaje_modal.set_text("100%")
+            titulo_modal.set_text("Procesamiento terminado")
             etapa_modal.set_text(
-                "Todos los ensayes fueron "
-                "procesados correctamente."
+                "Todos los ensayes fueron procesados correctamente."
             )
-
-            detalle_modal.set_text(
-                resultado.get(
-                    "mensaje",
-                    ""
-                )
-            )
-
-            spinner_modal.set_visibility(
-                False
-            )
-
+            detalle_modal.set_text(resultado.get("mensaje", ""))
+            spinner_modal.set_visibility(False)
             boton_cancelar.disable()
-
-            await asyncio.sleep(
-                0.8
-            )
-
+            await asyncio.sleep(0.8)
             dialogo_proceso.close()
 
             try:
                 await run.io_bound(historial_resultados.guardar, resultado)
             except Exception as error:
                 print(f"No se pudo guardar el historial de resultados: {error}")
-                ui.notify("No se pudo guardar este lote en Resultados.", type="negative")
+                ui.notify(
+                    "No se pudo guardar este lote en Resultados.",
+                    type="negative",
+                )
 
             ResumenProcesamientoUI.mostrar(
                 resultado,
@@ -764,66 +848,23 @@ async def ejecutar_procesamiento():
                 on_close=limpiar_sin_notificacion,
             )
 
-        # ====================================================
-        # CANCELADO
-        # ====================================================
-
         elif estado == "cancelado":
-
-            titulo_modal.set_text(
-                "Procesamiento cancelado"
-            )
-
-            etapa_modal.set_text(
-                "La cancelación terminó "
-                "de forma segura."
-            )
-
-            detalle_modal.set_text(
-                "Los mapas fueron conservados y "
-                "los Excel generados durante este "
-                "lote fueron eliminados."
-            )
-
-            spinner_modal.set_visibility(
-                False
-            )
-
-            barra_progreso.set_value(
-                0
-            )
-
-            porcentaje_modal.set_text(
-                ""
-            )
-
-            await asyncio.sleep(
-                1.5
-            )
-
+            # Se conserva por compatibilidad si WorkflowService se cancela
+            # internamente por otra vía.
+            await run.io_bound(_eliminar_excel_nuevos_del_lote)
             dialogo_proceso.close()
-
-            ui.notify(
-                "Procesamiento cancelado. "
-                "Puedes volver a procesar los "
-                "archivos cuando quieras.",
-                type="warning",
-                duration=7000,
-            )
-
-        # ====================================================
-        # ERROR / PARCIAL
-        # ====================================================
+            ui.notify("Procesamiento cancelado.", type="warning", duration=4000)
 
         else:
-
             dialogo_proceso.close()
-
             try:
                 await run.io_bound(historial_resultados.guardar, resultado)
             except Exception as error:
                 print(f"No se pudo guardar el historial de resultados: {error}")
-                ui.notify("No se pudo guardar este lote en Resultados.", type="negative")
+                ui.notify(
+                    "No se pudo guardar este lote en Resultados.",
+                    type="negative",
+                )
 
             ResumenProcesamientoUI.mostrar(
                 resultado,
@@ -832,35 +873,47 @@ async def ejecutar_procesamiento():
             )
 
     except Exception as error:
-
         print()
         print("=" * 80)
-        print(
-            "ERROR DESDE LA INTERFAZ"
-        )
+        print("ERROR DESDE LA INTERFAZ")
         print("=" * 80)
         print(error)
         print("=" * 80)
-
         dialogo_proceso.close()
-
         ui.notify(
-            "Ocurrió un problema inesperado "
-            "en la interfaz. "
-            "Revisa la consola técnica o contacta "
-            "al responsable del sistema.",
+            "Ocurrió un problema inesperado en el procesamiento. "
+            "Revisa la consola técnica o contacta al responsable del sistema.",
             type="negative",
             duration=10000,
         )
 
     finally:
+        # Si por una excepción el hijo siguiera vivo, no lo dejamos huérfano.
+        if proceso_trabajo is not None and proceso_trabajo.is_alive():
+            _matar_proceso_trabajo()
+            await asyncio.sleep(0.10)
 
+        try:
+            if proceso_trabajo is not None:
+                proceso_trabajo.join(timeout=0.5)
+        except Exception:
+            pass
+
+        try:
+            if cola_progreso_trabajo is not None:
+                cola_progreso_trabajo.close()
+            if cola_resultado_trabajo is not None:
+                cola_resultado_trabajo.close()
+        except Exception:
+            pass
+
+        proceso_trabajo = None
+        cola_progreso_trabajo = None
+        cola_resultado_trabajo = None
+        cancelacion_forzada = False
         procesando = False
-
         boton_procesar.enable()
-
         boton_cancelar.disable()
-
 
 def descargar_resultado_guardado(registro: dict):
     ruta = historial_resultados.ruta_descarga(registro["id"])
@@ -1613,10 +1666,8 @@ ui.on(
 # INICIAR
 # ============================================================
 
-if __name__ in {
-    "__main__",
-    "__mp_main__",
-}:
+if __name__ == "__main__":
+    mp.freeze_support()
     FAVICON_GEOTEST = (
         "data:image/jpeg;base64,"
         + base64.b64encode((CARPETA_STATIC / "logo.jpg").read_bytes()).decode("ascii")
